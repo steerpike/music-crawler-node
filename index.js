@@ -15,54 +15,127 @@ app.use(express.json());
 
 app.get('/artist/:name', async (req, res) => {
   const artistName = req.params.name;
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('get_artist_route');
 
   try {
-    // Try to get the artist from the database
-    const artist = await artists.findByNameWithAliases(artistName);
+    span.setAttribute('artist.name', artistName);
+    const artist = await findArtist(artistName, span);
 
     if (artist) {
-      // Artist found, return it
+      span.addEvent('artist_found_in_db');
       res.status(200).json(artist);
     } else {
-      // Artist not found, trigger a crawl in the background
+      triggerBackgroundCrawl(artistName, span);
       res.status(404).json({
         error: 'Artist not found',
         message: 'We\'re fetching data for this artist. Try again soon.'
       });
-
-      // Start a crawl if not already in progress
-      if (!crawlQueue.has(artistName)) {
-        crawlQueue.set(artistName, true);
-        console.log(`Crawling artist: ${artistName}`);
-
-        crawlArtist(artistName)
-          .then(async (result) => {
-            if (result.success) {
-              console.log('Crawled artist data:', result.artist);
-
-              // Save the artist data
-              try {
-                await artists.save(result.artist);
-                console.log(`Saved artist: ${result.artist.name}`);
-              } catch (saveError) {
-                console.error(`Failed to save artist: ${saveError.message}`);
-              }
-            } else {
-              console.error(`Failed to crawl artist ${artistName}: ${result.error}`);
-            }
-          })
-          .finally(() => {
-            crawlQueue.delete(artistName);
-          });
-
-        console.log(`Artist ${artistName} is not in the database. Starting crawl...`);
-      }
     }
   } catch (error) {
+    span.recordException(error);
     console.error('Error in /artist route:', error);
     res.status(500).json({ error: 'Server error' });
+  } finally {
+    span.end();
   }
 });
+
+/**
+ * Find an artist in the database
+ * @param {string} artistName - Name of the artist to find
+ * @param {object} parentSpan - Parent span for tracing
+ * @returns {Promise<object|null>} Artist object or null if not found
+ */
+async function findArtist(artistName, parentSpan) {
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('find_artist', { parent: parentSpan });
+
+  try {
+    span.setAttribute('artist.name', artistName);
+    const artist = await artists.findByNameWithAliases(artistName);
+    span.setAttribute('artist.found', !!artist);
+    return artist;
+  } catch (error) {
+    span.recordException(error);
+    throw error;
+  } finally {
+    span.end();
+  }
+}
+
+/**
+ * Trigger an artist crawl in the background
+ * @param {string} artistName - Name of artist to crawl
+ * @param {object} parentSpan - Parent span for tracing
+ */
+function triggerBackgroundCrawl(artistName, parentSpan) {
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('trigger_background_crawl', { parent: parentSpan });
+
+  try {
+    // Only crawl if not already in progress
+    if (crawlQueue.has(artistName)) {
+      span.addEvent('crawl_already_in_queue');
+      console.log(`Crawl already in progress for: ${artistName}`);
+      return;
+    }
+
+    // Mark as crawling and start the process
+    crawlQueue.set(artistName, true);
+    span.addEvent('crawl_started');
+    console.log(`Starting crawl for artist: ${artistName}`);
+
+    // Execute crawl in background
+    processCrawl(artistName);
+  } catch (error) {
+    span.recordException(error);
+    console.error(`Error triggering crawl for ${artistName}:`, error);
+  } finally {
+    span.end();
+  }
+}
+
+/**
+ * Process the actual artist crawl
+ * @param {string} artistName - Name of artist to crawl
+ */
+async function processCrawl(artistName) {
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('process_crawl');
+
+  try {
+    span.setAttribute('artist.name', artistName);
+
+    // Perform the crawl
+    const result = await crawlArtist(artistName);
+
+    if (result.success) {
+      span.addEvent('crawl_successful');
+      console.log(`Crawl successful for: ${artistName}`);
+
+      try {
+        await artists.saveWithVideos(result.artist);
+        span.addEvent('artist_saved');
+        console.log(`Saved artist: ${result.artist.name}`);
+      } catch (saveError) {
+        span.recordException(saveError);
+        console.error(`Failed to save artist: ${saveError.message}`);
+      }
+    } else {
+      span.addEvent('crawl_failed');
+      span.setAttribute('error.reason', result.error);
+      console.error(`Failed to crawl artist ${artistName}: ${result.error}`);
+    }
+  } catch (error) {
+    span.recordException(error);
+    console.error(`Unexpected error during crawl for ${artistName}:`, error);
+  } finally {
+    // Always clear from queue when finished
+    crawlQueue.delete(artistName);
+    span.end();
+  }
+}
 
 async function fetchLastFmData(artistName, span) {
   const encodedArtistName = encodeURIComponent(artistName);
@@ -106,6 +179,7 @@ function parseArtistData(html, span) {
 
   return {
     title: artistTitle,
+    url: `https://www.last.fm/music/${encodeURIComponent(artistTitle)}`,
     path: artistPath,
     videos
   };

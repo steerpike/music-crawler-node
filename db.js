@@ -12,6 +12,79 @@ const db = new sqlite3.Database('./music.db', (err) => {
 
 // Artist operations
 const artistsDb = {
+
+  /**
+   * Save artist with videos in a transaction
+   * @param {object} artistData - Complete artist data with videos
+   * @returns {Promise<object>} Result with success status
+   */
+  saveWithVideos: (artistData) => {
+    return new Promise((resolve, reject) => {
+      const tracer = trace.getTracer('music-crawler-db');
+      const span = tracer.startSpan('db.saveArtistWithVideos');
+      span.setAttribute('artist.name', artistData.name);
+
+      // Use a transaction for atomicity
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        // Insert artist
+        const artistSql = `
+          INSERT OR REPLACE INTO Artists (Name, Url, Path, LastCrawled)
+          VALUES (?, ?, ?, datetime('now'))
+        `;
+
+        db.run(artistSql, [artistData.name, artistData.url, artistData.path], function(err) {
+          if (err) {
+            db.run('ROLLBACK');
+            span.recordException(err);
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            span.end();
+            return reject(err);
+          }
+
+          const artistId = this.lastID;
+          const videoPromises = [];
+
+          // Process videos if they exist
+          if (artistData.videos && Object.keys(artistData.videos).length > 0) {
+            const videoStmt = db.prepare('INSERT OR IGNORE INTO Videos (Name, Url) VALUES (?, ?)');
+            const linkStmt = db.prepare('INSERT OR IGNORE INTO Artist_Videos (ArtistUrl, VideoUrl) VALUES (?, ?)');
+
+            try {
+              Object.entries(artistData.videos).forEach(([videoUrl, videoName]) => {
+                videoStmt.run(videoName, videoUrl);
+                linkStmt.run(artistData.url, videoUrl);
+              });
+
+              videoStmt.finalize();
+              linkStmt.finalize();
+            } catch (videoErr) {
+              db.run('ROLLBACK');
+              span.recordException(videoErr);
+              span.setStatus({ code: SpanStatusCode.ERROR });
+              span.end();
+              return reject(videoErr);
+            }
+          }
+
+          // Commit the transaction
+          db.run('COMMIT', (commitErr) => {
+            if (commitErr) {
+              span.recordException(commitErr);
+              span.setStatus({ code: SpanStatusCode.ERROR });
+              span.end();
+              reject(commitErr);
+            } else {
+              span.end();
+              resolve({ success: true, artistId });
+            }
+          });
+        });
+      });
+    });
+  },
+
   /**
    * Get artist by name
    * @param {string} name - Artist name to search for
@@ -51,13 +124,12 @@ const artistsDb = {
       span.setAttribute('artist.name', artist.name);
       span.setAttribute('artist.title', artist.title || '');
 
-      const url = `/music/${encodeURIComponent(artist.name)}`;
       const sql = `
         INSERT OR REPLACE INTO Artists (Name, Url, Path, LastCrawled)
         VALUES (?, ?, ?, datetime('now'))
       `;
 
-      db.run(sql, [artist.name, url, artist.path], function(err) {
+      db.run(sql, [artist.name, artist.url, artist.path], function(err) {
         if (err) {
           span.recordException(err);
           span.setStatus({ code: SpanStatusCode.ERROR });
@@ -76,6 +148,8 @@ const artistsDb = {
       });
     });
   },
+
+
 
   /**
    * Find artist by name with alias support
@@ -110,6 +184,7 @@ const artistsDb = {
       });
     });
   }
+
 };
 
 // Export the database and operations
