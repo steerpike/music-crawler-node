@@ -148,9 +148,39 @@ const artistsDb = {
       });
     });
   },
+  saveRelatedArtist: (artistUrl, relatedUrl) => {
+    return new Promise((resolve, reject) => {
+      const tracer = trace.getTracer('music-crawler-db');
+      const span = tracer.startSpan('db.saveRelatedArtists');
+      span.setAttribute('artist.url', artistUrl);
 
+      const sql = `
+        INSERT OR REPLACE INTO Similar_Artists (ArtistUrl, RelatedArtistUrl)
+        VALUES (?, ?)
+      `;
 
+      const stmt = db.prepare(sql);
+      stmt.run(artistUrl, relatedUrl);
+      /*
+      related.relatedArtists.forEach((relatedArtist) => {
+        const encodedRelatedName = encodeURIComponent(relatedArtist.name);
+        const relatedUrl = `https://www.last.fm/music/${encodedRelatedName}`
+        stmt.run(artistUrl, relatedUrl);
+      });*/
 
+      stmt.finalize((err) => {
+        if (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.end();
+          reject(err);
+        } else {
+          span.end();
+          resolve({ success: true });
+        }
+      });
+    });
+  },
   /**
    * Find artist by name with alias support
    * @param {string} name - Artist name to search for
@@ -187,9 +217,182 @@ const artistsDb = {
 
 };
 
+
+// Crawl Queue operations
+const queueDb = {
+  /**
+   * Save an artist to the crawl queue
+   * @param {string} artistName - Name of the artist to be crawled
+   * @param {string} sourceArtistUrl - URL of the artist that led to this discovery
+   * @returns {Promise<object>} Result with success status
+   */
+  saveToQueue: (artistName, sourceArtistUrl) => {
+    return new Promise((resolve, reject) => {
+      const tracer = trace.getTracer('music-crawler-db');
+      const span = tracer.startSpan('db.saveToQueue');
+
+      span.setAttribute('artist.name', artistName);
+      span.setAttribute('source_artist.url', sourceArtistUrl);
+
+      const sql = `
+        INSERT OR IGNORE INTO Crawl_Queue
+        (ArtistName, SourceArtistUrl, Status, CreatedAt, UpdatedAt)
+        VALUES (?, ?, 'pending', datetime('now'), datetime('now'))
+      `;
+
+      db.run(sql, [artistName, sourceArtistUrl], function(err) {
+        if (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.end();
+          reject(err);
+        } else {
+          span.setAttribute('db.changes', this.changes);
+          span.setAttribute('queue.added', this.changes > 0);
+          span.end();
+          resolve({
+            success: true,
+            id: this.lastID,
+            added: this.changes > 0 // true if newly added, false if already existed
+          });
+        }
+      });
+    });
+  },
+
+  /**
+   * Get the next artist to crawl from the queue
+   * @param {number} limit - Maximum number of artists to return
+   * @returns {Promise<Array>} Array of artists to crawl
+   */
+  getNextBatch: (limit = 1) => {
+    return new Promise((resolve, reject) => {
+      const tracer = trace.getTracer('music-crawler-db');
+      const span = tracer.startSpan('db.getNextBatch');
+      span.setAttribute('limit', limit);
+
+      const sql = `
+        SELECT * FROM Crawl_Queue
+        WHERE Status = 'pending'
+        ORDER BY CreatedAt ASC
+        LIMIT ?
+      `;
+
+      db.all(sql, [limit], (err, rows) => {
+        if (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.end();
+          reject(err);
+        } else {
+          span.setAttribute('queue.items_found', rows.length);
+          span.end();
+          resolve(rows);
+        }
+      });
+    });
+  },
+
+  /**
+   * Update the status of a queue item
+   * @param {number} id - Queue item ID
+   * @param {string} status - New status ('in_progress', 'completed', 'error')
+   * @param {string} errorMessage - Optional error message
+   * @returns {Promise<object>} Result with success status
+   */
+  updateStatus: (id, status, errorMessage = null) => {
+    return new Promise((resolve, reject) => {
+      const tracer = trace.getTracer('music-crawler-db');
+      const span = tracer.startSpan('db.updateQueueStatus');
+
+      span.setAttribute('queue.id', id);
+      span.setAttribute('queue.status', status);
+
+      let sql = '';
+      let params = [];
+
+      if (status === 'error' && errorMessage) {
+        sql = `
+          UPDATE Crawl_Queue
+          SET Status = ?,
+              ErrorMessage = ?,
+              AttemptCount = AttemptCount + 1,
+              UpdatedAt = datetime('now')
+          WHERE ID = ?
+        `;
+        params = [status, errorMessage, id];
+      } else {
+        sql = `
+          UPDATE Crawl_Queue
+          SET Status = ?,
+              UpdatedAt = datetime('now')
+          WHERE ID = ?
+        `;
+        params = [status, id];
+      }
+
+      db.run(sql, params, function(err) {
+        if (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.end();
+          reject(err);
+        } else {
+          span.setAttribute('db.changes', this.changes);
+          span.end();
+          resolve({ success: true, changes: this.changes });
+        }
+      });
+    });
+  },
+
+  /**
+   * Get queue statistics
+   * @returns {Promise<object>} Queue statistics
+   */
+  getStats: () => {
+    return new Promise((resolve, reject) => {
+      const tracer = trace.getTracer('music-crawler-db');
+      const span = tracer.startSpan('db.getQueueStats');
+
+      const sql = `
+        SELECT Status, COUNT(*) as Count
+        FROM Crawl_Queue
+        GROUP BY Status
+      `;
+
+      db.all(sql, [], (err, rows) => {
+        if (err) {
+          span.recordException(err);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          span.end();
+          reject(err);
+        } else {
+          const stats = {
+            total: 0,
+            pending: 0,
+            in_progress: 0,
+            completed: 0,
+            error: 0
+          };
+
+          rows.forEach(row => {
+            stats[row.Status.toLowerCase()] = row.Count;
+            stats.total += row.Count;
+          });
+
+          span.end();
+          resolve(stats);
+        }
+      });
+    });
+  }
+};
+
+
 // Export the database and operations
 module.exports = {
   db,
   artists: artistsDb,
-  // You can add more collections like videos, tags, etc. as needed
+  queue: queueDb,
 };

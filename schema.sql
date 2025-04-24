@@ -1,6 +1,5 @@
 CREATE TABLE Artists (
     ID INTEGER PRIMARY KEY,
-    Response INTEGER,
     Name TEXT,
     Url TEXT UNIQUE,
     Path TEXT UNIQUE,
@@ -49,9 +48,29 @@ CREATE TABLE Artist_Videos (
 );
 
 CREATE TABLE Similar_Artists (
-    ArtistUrl1 TEXT,
-    ArtistUrl2 TEXT,
-    FOREIGN KEY(ArtistUrl1) REFERENCES Artists(Url),
-    FOREIGN KEY(ArtistUrl2) REFERENCES Artists(Url),
-    UNIQUE(ArtistUrl1, ArtistUrl2)
+    ArtistUrl TEXT,
+    RelatedArtistUrl TEXT,
+    FOREIGN KEY(ArtistUrl) REFERENCES Artists(Url),
+    FOREIGN KEY(RelatedArtistUrl) REFERENCES Artists(Url),
+    UNIQUE(ArtistUrl, RelatedArtistUrl)
 );
+
+-- Queue table for tracking artists to be crawled
+CREATE TABLE Crawl_Queue (
+    ID INTEGER PRIMARY KEY,
+    ArtistName TEXT NOT NULL,
+    SourceArtistUrl TEXT,  -- The artist that led to this discovery
+    Status TEXT DEFAULT 'pending', -- 'pending', 'in_progress', 'completed', 'error'
+    AttemptCount INTEGER DEFAULT 0, -- Track retry attempts
+    ErrorMessage TEXT,             -- Store last error if any
+    CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(SourceArtistUrl) REFERENCES Artists(Url),
+    UNIQUE(ArtistName, SourceArtistUrl)  -- Prevent duplicate entries
+);
+
+-- Index for efficient queue processing
+CREATE INDEX idx_crawl_queue_status ON Crawl_Queue(Status);
+
+-- Index for tracking source relationships
+CREATE INDEX idx_crawl_queue_source ON Crawl_Queue(SourceArtistUrl);

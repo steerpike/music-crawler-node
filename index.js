@@ -4,7 +4,8 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { trace, SpanStatusCode } = require('@opentelemetry/api');
-const { db, artists } = require('./db');
+const { artists, queue } = require('./db');
+const musicmap = require('./musicmap');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,19 +15,19 @@ const crawlQueue = new Map();
 app.use(express.json());
 
 app.get('/artist/:name', async (req, res) => {
-  const artistName = req.params.name;
+  const userInput = req.params.name;
   const tracer = trace.getTracer('music-crawler');
   const span = tracer.startSpan('get_artist_route');
 
   try {
-    span.setAttribute('artist.name', artistName);
-    const artist = await findArtist(artistName, span);
+    span.setAttribute('artist.name', userInput);
+    const artist = await findArtist(userInput, span);
 
     if (artist) {
       span.addEvent('artist_found_in_db');
       res.status(200).json(artist);
     } else {
-      triggerBackgroundCrawl(artistName, span);
+      triggerBackgroundCrawl(userInput, span);
       res.status(404).json({
         error: 'Artist not found',
         message: 'We\'re fetching data for this artist. Try again soon.'
@@ -39,6 +40,53 @@ app.get('/artist/:name', async (req, res) => {
   } finally {
     span.end();
   }
+});
+
+app.get('/process-queue', async (req, res) => {
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('process_queue');
+  try {
+    // Get next batch of artists to crawl
+    const batch = await queue.getNextBatch(5);
+    if (batch.length === 0) {
+      res.status(200).json({ message: 'No artists in queue' });
+      return;
+    }
+    for (const item of batch) {
+      console.log(`Processing queued artist: ${item.ArtistName}`);
+      // Mark as in progress
+      await queue.updateStatus(item.ID, 'in_progress');
+
+      try {
+        const artist = await findArtist(item.ArtistName, span);
+        if (artist) {
+          span.addEvent('artist_found_in_db');
+          res.status(200).json(artist);
+        } else {
+          const result = await crawlArtist(item.ArtistName);
+          await artists.saveWithVideos(result.artist);
+          span.addEvent('artist_saved');
+          console.log(`Original artist`, item.SourceArtistUrl);
+          console.log(`Related artist`, result.artist.url);
+          artists.saveRelatedArtist(item.SourceArtistUrl, result.artist.url);
+        }
+        // Mark as completed
+        await queue.updateStatus(item.ID, 'completed');
+      } catch (error) {
+        console.error(`Error processing ${item.ArtistName}:`, error);
+        span.recordException(error);
+        await queue.updateStatus(item.ID, 'error', error.message);
+      }
+    }
+  } catch (error) {
+    console.error('Error processing queue:', error);
+    span.recordException(error);
+    res.status(500).json({ error: 'Server error processing queue' });
+  }
+  // Log queue statistics
+  const stats = await queue.getStats();
+  console.log('Queue stats:', stats);
+  res.status(200).json(stats);
 });
 
 /**
@@ -115,9 +163,14 @@ async function processCrawl(artistName) {
       console.log(`Crawl successful for: ${artistName}`);
 
       try {
-        await artists.saveWithVideos(result.artist);
+        const res = await artists.saveWithVideos(result.artist);
         span.addEvent('artist_saved');
-        console.log(`Saved artist: ${result.artist.name}`);
+        const related = await musicmap.fetchRelatedArtists(result.artist.name, span);
+        if(related.success) {
+          related.relatedArtists.forEach(async (relatedArtist) => {
+            await queue.saveToQueue(relatedArtist.name, result.artist.url);
+          })
+        }
       } catch (saveError) {
         span.recordException(saveError);
         console.error(`Failed to save artist: ${saveError.message}`);
