@@ -3,6 +3,11 @@ require('./tracing.js');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const passport = require('passport');
+const artistNetwork = require('./artist-network');
+const youtube = require('./youtube');
+const session = require('express-session');
+const GoogleStrategy = require('passport-google-oauth2').Strategy;
 const { trace, SpanStatusCode } = require('@opentelemetry/api');
 const { artists, queue } = require('./db');
 const musicmap = require('./musicmap');
@@ -12,7 +17,263 @@ const PORT = process.env.PORT || 3000;
 
 const crawlQueue = new Map();
 
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: true,
+}));
+app.use(passport.initialize());
+app.use(passport.session());
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: '/auth/google/callback'
+}, (accessToken, refreshToken, profile, done) => {
+  profile.accessToken = accessToken;
+  profile.refreshToken = refreshToken;
+  done(null, profile);
+}));
 app.use(express.json());
+
+passport.serializeUser((user, done) => {
+  done(null, user);
+});
+passport.deserializeUser((user, done) => {
+  done(null, user);
+});
+
+app.get('/', (req, res) => {
+  res.send('Welcome to the Music Crawler API! <a href="/auth/google">Login with Google</a>');
+});
+
+app.get('/auth/google', passport.authenticate('google', {
+  scope: [
+    'profile',
+    'email',
+    'https://www.googleapis.com/auth/youtube'
+  ]
+}));
+
+app.get('/auth/google/callback', passport.authenticate('google', {
+  successRedirect: '/profile',
+  failureRedirect: '/'
+}));
+
+app.get('/profile', (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.redirect('/');
+  }
+  res.send(`Hello ${req.user.displayName}! <a href="/logout">Logout</a>`);
+});
+
+app.get('/logout', (req, res) => {
+  req.logout((err) => {
+    if (err) {
+      console.error('Error logging out:', err);
+    }
+    res.redirect('/');
+  });
+});
+
+
+app.get('/query/:name/random-videos', async (req, res) => {
+  const artistName = req.params.name;
+  const maxRelated = parseInt(req.query.maxRelated || '5', 10);
+  const count = parseInt(req.query.count || '20', 10);
+
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('random_videos_endpoint');
+
+  try {
+    span.setAttribute('artist.name', artistName);
+
+    const result = await artistNetwork.getRandomVideosFromArtistNetwork(
+      artistName,
+      maxRelated,
+      count,
+      span
+    );
+
+    if (result.success) {
+      res.status(200).json(result);
+    } else {
+      res.status(404).json(result);
+    }
+  } catch (error) {
+    span.recordException(error);
+    console.error('Error in random videos endpoint:', error);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    span.end();
+  }
+});
+
+app.get('/playlist/:name', async (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { accessToken } = req.user;
+  const artistName = req.params.name;
+  const maxRelated = parseInt(req.query.maxRelated || '5', 10);
+  const videoCount = parseInt(req.query.count || '20', 10);
+
+  const tracer = trace.getTracer('music-crawler');
+  const span = tracer.startSpan('create_network_playlist');
+
+  try {
+    span.setAttribute('artist.name', artistName);
+    span.setAttribute('max_related', maxRelated);
+    span.setAttribute('video_count', videoCount);
+
+    // Check if the artist exists in our database
+    const artist = await findArtist(artistName, span);
+    if (!artist) {
+      span.addEvent('artist_not_found');
+      return res.status(404).json({
+        success: false,
+        error: 'Artist not found',
+        message: 'Artist not found in the database'
+      });
+    }
+
+    span.addEvent('artist_found');
+    span.setAttribute('artist.id', artist.ID);
+
+    // Create a dynamic playlist title and description
+    const playlistTitle = `${artistName} and Similar Artists Mix`;
+    const playlistDescription = `A playlist of ${artistName} and related artists created by Music Crawler`;
+    const isPrivate = false;
+
+    span.setAttribute('playlist.title', playlistTitle);
+    span.setAttribute('playlist.description', playlistDescription);
+
+    // Get random videos from the artist network
+    span.addEvent('fetching_network_videos');
+    const videosResult = await artistNetwork.getRandomVideosFromArtistNetwork(
+      artistName,
+      maxRelated,
+      videoCount,
+      span
+    );
+
+    if (!videosResult.success || videosResult.videos.length === 0) {
+      span.addEvent('no_videos_found');
+      return res.status(404).json({
+        success: false,
+        error: 'No videos found',
+        message: 'Could not find any videos for this artist and related artists'
+      });
+    }
+
+    span.setAttribute('videos.found', videosResult.videos.length);
+    span.addEvent('creating_playlist');
+
+    // Create the YouTube playlist
+    const playlistResult = await youtube.createPlaylist(
+      accessToken,
+      playlistTitle,
+      playlistDescription,
+      isPrivate
+    );
+
+    if (!playlistResult.success) {
+      span.addEvent('playlist_creation_failed');
+      span.setAttribute('error.message', playlistResult.error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create playlist',
+        message: playlistResult.error
+      });
+    }
+
+    const playlistId = playlistResult.playlist.id;
+    span.setAttribute('playlist.id', playlistId);
+    span.addEvent('playlist_created');
+
+    // Add videos to the playlist
+    const addedVideos = [];
+    const failedVideos = [];
+
+    for (const video of videosResult.videos) {
+      // Extract YouTube video ID from URL
+      const videoIdMatch = video.Url?.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\?]+)/);
+
+      if (!videoIdMatch) {
+        failedVideos.push({
+          name: video.Name,
+          artistName: video.artistName,
+          url: video.Url,
+          reason: 'Not a valid YouTube URL'
+        });
+        continue;
+      }
+
+      const videoId = videoIdMatch[1];
+
+      try {
+        const addResult = await youtube.addVideoToPlaylist(accessToken, playlistId, videoId);
+
+        if (addResult.success) {
+          addedVideos.push({
+            name: video.Name,
+            artistName: video.artistName,
+            videoId
+          });
+          span.addEvent('video_added_to_playlist');
+        } else {
+          failedVideos.push({
+            name: video.Name,
+            artistName: video.artistName,
+            videoId,
+            reason: addResult.error
+          });
+          span.addEvent('video_add_failed');
+        }
+      } catch (error) {
+        span.recordException(error);
+        failedVideos.push({
+          name: video.Name,
+          artistName: video.artistName,
+          videoId,
+          reason: error.message
+        });
+      }
+    }
+
+    span.setAttribute('videos.added', addedVideos.length);
+    span.setAttribute('videos.failed', failedVideos.length);
+
+    // Return the results
+    res.status(200).json({
+      success: true,
+      playlist: {
+        id: playlistId,
+        title: playlistTitle,
+        url: `https://www.youtube.com/playlist?list=${playlistId}`
+      },
+      stats: {
+        totalVideosFound: videosResult.totalVideosFound,
+        relatedArtistsCount: videosResult.relatedArtistsCount,
+        videosAdded: addedVideos.length,
+        videosFailed: failedVideos.length
+      },
+      addedVideos,
+      failedVideos
+    });
+
+  } catch (error) {
+    span.recordException(error);
+    console.error('Error creating network playlist:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error',
+      message: error.message
+    });
+  } finally {
+    span.end();
+  }
+});
 
 app.get('/artist/:name', async (req, res) => {
   const userInput = req.params.name;
@@ -66,12 +327,11 @@ app.get('/process-queue', async (req, res) => {
           const result = await crawlArtist(item.ArtistName);
           await artists.saveWithVideos(result.artist);
           span.addEvent('artist_saved');
-          console.log(`Original artist`, item.SourceArtistUrl);
-          console.log(`Related artist`, result.artist.url);
           artists.saveRelatedArtist(item.SourceArtistUrl, result.artist.url);
         }
         // Mark as completed
         await queue.updateStatus(item.ID, 'completed');
+        span.setAttribute('artist.updated', item.ArtistName);
       } catch (error) {
         console.error(`Error processing ${item.ArtistName}:`, error);
         span.recordException(error);
