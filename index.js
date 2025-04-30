@@ -308,7 +308,7 @@ app.get('/process-queue', async (req, res) => {
   const span = tracer.startSpan('process_queue');
   try {
     // Get next batch of artists to crawl
-    const batch = await queue.getNextBatch(5);
+    const batch = await queue.getNextBatch(10);
     if (batch.length === 0) {
       res.status(200).json({ message: 'No artists in queue' });
       return;

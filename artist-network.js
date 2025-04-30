@@ -9,7 +9,7 @@ const { db, artists } = require('./db');
  * @param {object} parentSpan - Optional parent span for tracing
  * @returns {Promise<object>} Result object with randomly selected videos
  */
-async function getRandomVideosFromArtistNetwork(artistName, maxRelatedArtists = 100, resultCount = 20, parentSpan = null) {
+async function getRandomVideosFromArtistNetwork(artistName, maxRelatedArtists = 100, resultCount = 50, parentSpan = null) {
   const tracer = trace.getTracer('music-crawler');
   const span = tracer.startSpan('get_random_videos_from_network',
     parentSpan ? { parent: parentSpan } : undefined);
