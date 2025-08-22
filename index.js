@@ -116,7 +116,7 @@ app.get('/playlist/:name', async (req, res) => {
   const { accessToken } = req.user;
   const artistName = req.params.name;
   const maxRelated = parseInt(req.query.maxRelated || '5', 10);
-  const videoCount = parseInt(req.query.count || '20', 10);
+  const videoCount = parseInt(req.query.count || '50', 10);
 
   const tracer = trace.getTracer('music-crawler');
   const span = tracer.startSpan('create_network_playlist');
